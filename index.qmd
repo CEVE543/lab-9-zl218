@@ -1,7 +1,7 @@
 ---
 title: "CEVE 543 Fall 2025 Lab 9: Weather Typing with Hidden Markov Models"
 subtitle: "Temporal clustering of synoptic patterns using HMMs"
-author: CEVE 543 Fall 2025
+author: Zijie (Ian) Liang
 date: "2025-11-07"
 type: "lab"
 module: 2
@@ -23,14 +23,14 @@ format:
     code-block-border-left: "#e1e4e5"
     theme: simplex
     number-sections: true
-    fig-format: svg
+    fig-format: png
   typst:
     fontsize: 11pt
     margin:
       x: 1in
       y: 1in
     number-sections: true
-    fig-format: svg
+    fig-format: png
 
 execute:
   cache: true
@@ -87,6 +87,7 @@ using Distributions
 using Random
 using Dates
 using LinearAlgebra: diag
+using StatsBase
 ```
 
 It's always good practice to set a random seed for reproducibility:
@@ -627,10 +628,241 @@ K-means cannot do this - it fundamentally ignores temporal order.
 
 1. Fit HMMs with 3, 4, 5, and 7 states. How does the transition matrix structure change? Is temporal persistence stronger with fewer or more states?
 
-1. Run the same HMM configuration (6 states, 4 PCs) with 3 different random seeds. How different are the resulting state patterns and transition matrices?
+*When I fit `HMMs` with 3 or 4 states, the transition probability matrices show very strong diagonal dominance. The diagonal entries, probability of staying in the same state, are typically high (often 0.6–0.9 depending on the fit). Each state is persistent and tends to last for multiple consecutive days. With fewer states, each state represents a broad synoptic regime, so the model has little reason to switch frequently. As I increase the number of states to 5 or 7, the diagonal elements weaken, and off-diagonal transition probabilities become more prominent. The model begins to represent finer-scale sub-regimes, which are naturally less persistent. In these cases, states switch more frequently, and certain pairs of states may show preferred transition pathways.*
 
-1. Compare results to the $K$-means clustering from lab 8. Where do they agree and disagree? Why?
+2. Run the same HMM configuration (6 states, 4 PCs) with 3 different random seeds. How different are the resulting state patterns and transition matrices?
 
-1. Write code to generate synthetic weather sequences from your fitted HMM using the `rand()` function. Create a 120-day sequence with corresponding PC values and spatial maps for a few days. Compare state frequencies, transition frequencies, and PC distributions between real and synthetic data.
+*When the model run the same 6-state `HMM` with different random seeds, the overall structure is similar but some details shift. The broad synoptic regimes usually appear in all three runs since they are strongly supported by the PC data. However, the exact spatial patterns and PC means can rotate or reorder.The transition matrices also maintain the same qualitative shape: a few states show high persistence, and certain pairs of states recur as common transitions. However, the exact transition probabilities can vary noticeably between seeds especially for states that occur less frequently.*
 
-1. Describe how you would extend this to predict rainfall. What emission distribution would you use? How would you validate whether HMM states relate to rainfall patterns? What are the fundamental limitations for extreme rainfall?
+3. Compare results to the $K$-means clustering from lab 8. Where do they agree and disagree? Why?
+
+*`K-means` and `HMM` generally agree on the spatial patterns of the weather regimes. Because both methods cluster in the same PC space, they tend to identify similar large-scale circulation types. For example, both methods pick out the strong cyclonic regime and the more zonal, weaker-flow regime. They disagree in how days are assigned to those regimes. `K-means` treats each day independently, so the sequence of assigned weather types can jump rapidly from one regime to another. The `HMM`, by contrast, includes a transition matrix that enforces temporal persistence. The `HMM` produces longer and smoother periods where the atmosphere remains in the same state.*
+
+4. Write code to generate synthetic weather sequences from your fitted HMM using the `rand()` function. Create a 120-day sequence with corresponding PC values and spatial maps for a few days. Compare state frequencies, transition frequencies, and PC distributions between real and synthetic data.
+
+First, I set up some functions that good for used.
+```{julia}
+# Empirical transition matrix
+function empirical_transition_matrix(states::Vector{Int}, K::Int)
+    counts = zeros(Float64, K, K)
+    for t in 1:length(states)-1
+        i, j = states[t], states[t+1]
+        counts[i, j] += 1
+    end
+    eps = 1e-12
+    row_sums = sum(counts, dims=2) .+ eps
+    return counts ./ row_sums
+end
+
+# Fallback simulator
+
+function simulate_hmm(hmm, T::Int)
+    π  = initialization(hmm)          # initial state probabilities
+    A  = transition_matrix(hmm)       # K×K transition matrix
+    Ds = obs_distributions(hmm)       # vector of emission distributions (one per state)
+
+    K = length(π)
+    states = Vector{Int}(undef, T)
+    states[1] = sample(1:K, Weights(π))
+    for t in 2:T
+        states[t] = sample(1:K, Weights(A[states[t-1], :]))
+    end
+    obs = [rand(Ds[states[t]]) for t in 1:T]
+    return obs, states
+end
+
+# Unified entry point for simulation
+
+function generate_synthetic_sequence(hmm, T::Int)
+    sim = rand(hmm, T)  # try package simulator
+    if isstructtype(typeof(sim)) && hasproperty(sim, :state_seq) && hasproperty(sim, :obs_seq)
+        return sim.obs_seq, sim.state_seq
+    else
+        # Older versions may return only observations; use manual path
+        return simulate_hmm(hmm, T)
+    end
+end
+
+```
+
+
+I created 120 dataset in sequence.
+```{julia}
+# Generate a 120-day synthetic sequence 
+Random.seed!(543)
+T_syn = 120
+syn_obs, syn_states = generate_synthetic_sequence(hmm_trained, T_syn)
+
+# Convert to T_syn × n_pcs matrix
+syn_pc = reduce(vcat, (permutedims(obs) for obs in syn_obs))  # each obs is a row
+
+println("Synthetic sequence length: ", size(syn_pc))
+println("First 10 synthetic states: ", syn_states[1:min(10, length(syn_states))])
+
+```
+
+Then I conver the PC back to the the spatial map for selective days
+```{julia}
+# Reconstruct a few synthetic spatial maps 
+sel_days = filter(d -> d ≤ T_syn, [1, 30, 60, 90])
+
+# Use names that won't shadow YAXArrays.lon/lat
+ψ_array = Array(pca_data.ψ_anomaly)
+nlons, nlats, _ = size(ψ_array)
+lons = pca_data.coordinates.lon
+lats = pca_data.coordinates.lat
+
+reconstructed_maps = Dict{Int, Array{Float64,2}}()
+for d in sel_days
+    # Ensure a plain Vector for reconstruct (safer than RowVector)
+    μ = vec(syn_pc[d, :])
+    ψ_vec = MultivariateStats.reconstruct(pca_data.pca_model, μ)  # back to flattened field
+    reconstructed_maps[d] = reshape(ψ_vec, nlons, nlats)
+end
+
+```
+
+Next, I tried to plot these anomaly maps
+```{julia}
+# Quick plot
+let
+    n = length(sel_days)
+    ncols = min(n, 3)
+    nrows = ceil(Int, n / ncols)
+    vmax = maximum(abs, vcat([reconstructed_maps[d] for d in sel_days]...))
+    crange = (-vmax, vmax)
+    fig = Figure(size=(1000, 350*nrows))
+    for (k, d) in enumerate(sel_days)
+        r = div(k-1, ncols) + 1
+        c = mod(k-1, ncols) + 1
+        ax = create_geoaxis(fig, (r, c); title="Synthetic Day $d (State $(syn_states[d]))")
+        heatmap!(ax, lons, lats, reconstructed_maps[d]; colormap=:PuOr, colorrange=crange)
+        add_boundaries!(ax)
+    end
+    Colorbar(fig[:, ncols+1], label=L"$\psi$ Anomaly ($10^6$ m$^2$/s)")
+    fig
+end
+
+```
+
+Compared the real data and the synthetic data
+```{julia}
+# Real NDJF comparators
+times = pca_data.coordinates.time
+years = unique(year.(times))
+ndjf_mask = falses(length(times))
+for y in years
+    season_mask = ((year.(times) .== y) .& (month.(times) .>= 11)) .|
+                  ((year.(times) .== y + 1) .& (month.(times) .<= 2))
+    ndjf_mask .|= season_mask
+end
+real_pc_ndjf = pca_data.pc_scores[ndjf_mask, :]  # nt×n_pcs (the training subset)
+real_states_ndjf = all_states                    # your Viterbi states over NDJF
+
+# Compare state frequencies 
+n_states = maximum(real_states_ndjf)             # or pass your known K
+real_state_freq = counts(real_states_ndjf, 1:n_states)
+syn_state_freq  = counts(syn_states,       1:n_states)
+println("\nState frequency (REAL NDJF):   ", real_state_freq)
+println("State frequency (SYNTHETIC):   ", syn_state_freq)
+```
+
+Use the transition matrices to view the differences.
+```{julia}
+# Compare transition matrices
+real_A_emp = empirical_transition_matrix(real_states_ndjf, n_states)
+syn_A_emp  = empirical_transition_matrix(syn_states,       n_states)
+
+println("\nEmpirical transition matrix (REAL):")
+show(stdout, "text/plain", round.(real_A_emp, digits=3)); println()
+println("\nEmpirical transition matrix (SYNTHETIC):")
+show(stdout, "text/plain", round.(syn_A_emp, digits=3)); println()
+
+let
+    fig = Figure(size=(1100, 450))
+    ax1 = Axis(fig[1, 1], title="REAL: Transition Probabilities", xlabel="To", ylabel="From",
+               xticks=1:n_states, yticks=1:n_states, aspect=DataAspect())
+    hm1 = heatmap!(ax1, real_A_emp, colormap=:Blues, colorrange=(0, 1))
+    Colorbar(fig[1, 2], hm1, label="P")
+
+    ax2 = Axis(fig[1, 3], title="SYNTHETIC: Transition Probabilities", xlabel="To", ylabel="From",
+               xticks=1:n_states, yticks=1:n_states, aspect=DataAspect())
+    hm2 = heatmap!(ax2, syn_A_emp, colormap=:Blues, colorrange=(0, 1))
+    Colorbar(fig[1, 4], hm2, label="P")
+    fig
+end
+
+
+```
+
+Also, I compared the PC distributions with graphs.
+```{julia}
+n_pcs = size(real_pc_ndjf, 2)
+
+let
+    ncols = min(n_pcs, 2)
+    nrows = ceil(Int, n_pcs / ncols)
+    fig = Figure(size=(900, 320*nrows))
+
+    
+    step_xy = function (h::Histogram)
+        edges = collect(h.edges[1])                        # bin edges (length nbins+1)
+        weights = h.weights ./ max(sum(h.weights), 1)      # normalize to probability mass
+        xs = vcat(edges[1], vec(repeat(edges[2:end], inner=2)), edges[end])
+        ys = vcat(0.0, vec(repeat(weights, inner=2)), 0.0)
+        return xs, ys
+    end
+
+    for j in 1:n_pcs
+        r = div(j-1, ncols) + 1
+        c = mod(j-1, ncols) + 1
+        ax = Axis(fig[r, c], title="PC$j Distribution (REAL vs SYN)",
+                  xlabel="PC$j", ylabel="Frequency (normalized)")
+
+        # Ensure both vectors are Float64
+        real_j = collect(Float64.(real_pc_ndjf[:, j]))
+        syn_j  = collect(Float64.(syn_pc[:, j]))
+
+        # Correct Histogram API: pass nbins as a keyword
+        h_real = fit(Histogram, real_j; nbins=30, closed=:left)
+        h_syn  = fit(Histogram, syn_j;  nbins=30, closed=:left)
+
+        xs_r, ys_r = step_xy(h_real)
+        xs_s, ys_s = step_xy(h_syn)
+
+        # Draw step curves (no explicit colors)
+        lines!(ax, xs_r, ys_r, linewidth=2, label="REAL")
+        lines!(ax, xs_s, ys_s, linewidth=2, linestyle=:dash, label="SYN")
+        axislegend(ax, position=:rt)
+    end
+
+    fig
+end
+
+```
+
+Finally let me check the numberival differences.
+```{julia}
+# Numeric summaries
+# Compare mean and std of each PC between REAL (NDJF) and SYN sequences.
+println("\nPC means (REAL vs SYN):")
+for j in 1:n_pcs
+    real_j = Float64.(real_pc_ndjf[:, j])
+    syn_j  = Float64.(syn_pc[:, j])
+
+    m_real = mean(real_j); s_real = std(real_j)
+    m_syn  = mean(syn_j);  s_syn  = std(syn_j)
+
+    println(
+        "PC$j: mean(real)=$(round(m_real, digits=2)), ",
+        "std(real)=$(round(s_real, digits=2))  |  ",
+        "mean(syn)=$(round(m_syn, digits=2)), ",
+        "std(syn)=$(round(s_syn, digits=2))"
+    )
+end
+
+```
+
+5. Describe how you would extend this to predict rainfall. What emission distribution would you use? How would you validate whether HMM states relate to rainfall patterns? What are the fundamental limitations for extreme rainfall?
+
+*To extend my `HMM` to rainfall, I would keep the `HMM` trained on the circulation PCs and then model rainfall as a state-dependent emission. For each hidden state, I would estimate the probability of a wet day and model positive rainfall amounts with a lognormal distribution. To validate the connection between states and rainfall, I would composite rainfall by state and check whether some states show consistently higher rainfall or higher wet-day frequency. Clear differences would indicate that the `HMM` states are meteorologically meaningful. The main limitation is that extreme rainfall often comes from localized convection not fully captured by large-scale PCs.*
